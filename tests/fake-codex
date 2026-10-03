@@ -9,6 +9,8 @@ import time
 
 root = os.environ['FAKE_DIR']
 args = sys.argv[1:]
+if args[args.index('--sandbox') + 1] == 'workspace-write':
+    with open(os.path.join(args[args.index('-C') + 1], 'created.txt'), 'w') as f: f.write('repo file\n')
 with open(os.path.join(root, 'argv.json'), 'w') as f:
     json.dump(args, f)
 with open(os.path.join(root, 'stdin'), 'wb') as f:

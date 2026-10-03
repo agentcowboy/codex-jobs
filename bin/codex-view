@@ -8,6 +8,7 @@ import os
 import re
 import select
 import shutil
+from stat import S_ISREG
 import sys
 import termios
 import time
@@ -66,6 +67,8 @@ def roster(directory):
         if not entry.name.endswith('.json'):
             continue
         try:
+            if not S_ISREG(os.stat(entry.path).st_mode):
+                raise ValueError()
             with open(entry.path, 'rb') as f:
                 raw = f.read(RECORD_CAP + 1)
             if len(raw) > RECORD_CAP:
@@ -83,6 +86,8 @@ def roster(directory):
             data['state'] = identity(data)
             jobs.append(data)
         except OSError:
+            if not os.path.lexists(entry.path):
+                continue
             jobs.append(dict(job_id=entry.name, state='unreadable'))
         except (ValueError, TypeError, AttributeError, RecursionError):
             jobs.append(dict(job_id=entry.name, state='malformed'))
@@ -119,7 +124,7 @@ class Follower:
             error = data.get('error', data.get('message', 'unknown error'))
             if isinstance(error, dict):
                 error = error.get('message', 'unknown error')
-            self.note('{}: {}'.format(kind, error))
+            self.note('{}: {}'.format(kind, error or 'unknown error'))
         elif kind == 'turn.completed':
             self.status = 'completed (earlier error)' if self.failed else 'completed'
         elif kind in ('thread.started', 'turn.started'):
@@ -171,8 +176,11 @@ class Follower:
     def refresh(self):
         self.bytes_read = 0
         try:
+            stat = os.stat(self.path)
+            if not S_ISREG(stat.st_mode):
+                self.input_state = 'unreadable'
+                return
             with open(self.path, 'rb') as f:
-                stat = os.fstat(f.fileno())
                 file_id = (stat.st_dev, stat.st_ino)
                 if self.file_id is not None and (file_id != self.file_id or stat.st_size < self.offset):
                     self.offset = 0
@@ -191,7 +199,7 @@ class Follower:
                 self.feed(chunk)
         except FileNotFoundError:
             self.input_state = 'unavailable'
-        except OSError:
+        except (OSError, ValueError, UnicodeError):
             self.input_state = 'unreadable'
 
 
@@ -256,8 +264,9 @@ class View:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--log', help='follow an explicit JSONL file (EOF is not completion)')
-    parser.add_argument('--registry', help='registry directory (default: caller state directory)')
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument('--log', help='follow an explicit JSONL file (EOF is not completion)')
+    source.add_argument('--registry', help='registry directory (default: caller state directory)')
     parser.add_argument('--once', action='store_true', help='render one refresh and exit')
     args = parser.parse_args()
     view = View(directory=os.path.abspath(args.registry) if args.registry else None,

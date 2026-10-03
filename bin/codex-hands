@@ -2,6 +2,7 @@
 # Foreground Linux supervisor. The launch handshake establishes group ownership.
 set -euo pipefail
 set +m
+caller_umask=$(umask)
 umask 077
 usage() { echo 'usage: codex-hands [resume] --cwd DIR [--sandbox read-only|workspace-write] [SESSION] MODEL EFFORT PROMPT-FILE OUT-FILE [RUNLOG]' >&2; exit 2; }
 mode=fresh
@@ -26,40 +27,51 @@ command -v python3 >/dev/null || { echo 'python3 is required' >&2; exit 2; }
 command -v setsid >/dev/null || { echo 'setsid is required' >&2; exit 2; }
 exe=${CODEX_BIN:-codex}
 command -v "$exe" >/dev/null || { echo 'Codex executable is unavailable' >&2; exit 2; }
-# Refuse aliases across inputs, artifacts and rotation destinations before mutation.
-python3 - "$prompt" "$out" "$log" <<'PY'
-import os, sys
+# Keep the caller's stdin visible when validating /dev/stdin or /dev/fd prompts.
+# Refuse controls and aliases before artifact mutation.
+validated=$(python3 -I -c '
+import os, sys, unicodedata
 prompt, out, log = sys.argv[1:]
-paths = [prompt, out, log, log+'.stderr', out+'.done', out+'.prev',
-         out+'.failed', log+'.prev', log+'.stderr.prev']
+raw_paths = (prompt, out, log)
+out, log = [os.path.join(os.path.realpath(os.path.dirname(p) or "."), os.path.basename(p)) for p in (out, log)]
+if any(unicodedata.category(c) == "Cc" for path in raw_paths + (out, log) for c in path):
+    sys.exit("prompt, OUT and RUNLOG paths must not contain control characters")
+paths = [prompt, out, log, log+".stderr", out+".done", out+".prev",
+         out+".failed", log+".prev", log+".stderr.prev"]
 for i, path in enumerate(paths):
     if (i and os.path.islink(path)) or (os.path.exists(path) and not os.path.isfile(path)):
-        sys.exit('prompt and artifacts must be regular files; artifact symlinks are refused')
+        sys.exit("prompt and artifacts must be regular files; artifact symlinks are refused")
     for other in paths[:i]:
         if os.path.realpath(path) == os.path.realpath(other) or (
             os.path.exists(path) and os.path.exists(other) and os.path.samefile(path, other)):
-            sys.exit('artifact alias refused')
-for path in (out, log, log+'.stderr'):
-    if not os.path.isdir(os.path.dirname(os.path.abspath(path))):
-        print('artifact directory is unavailable', file=sys.stderr)
+            sys.exit("artifact alias refused")
+for path in (out, log, log+".stderr"):
+    if not os.path.isdir(os.path.dirname(path)):
+        print("artifact directory is unavailable", file=sys.stderr)
         sys.exit(2)
-PY
+sys.stdout.write(out+"\n"+log+".")
+' "$prompt" "$out" "$log")
+# Validated paths contain no controls; use this single capture for every artifact.
+out=${validated%%$'\n'*}
+log=${validated#*$'\n'}
+log=${log%.}
 [[ -f $prompt && -r $prompt ]] || { echo 'prompt is unavailable' >&2; exit 2; }
-cwd=$(cd -- "$cwd" && pwd -P)
-out=$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$out")
-log=$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$log")
+# Sentinels preserve trailing newlines in every canonical path capture.
+cwd=$(CDPATH= cd -- "$cwd" && pwd -P && printf '.')
+cwd=${cwd%$'\n.'}
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/codex-jobs.XXXXXXXX")
+trap 'rm -rf -- "$scratch"' EXIT
 rm -f -- "$out.done"
 for file in "$out" "$log" "$log.stderr"; do
     [[ ! -e $file ]] || mv -f -- "$file" "$file.prev"
 done
 # Explicit creation modes also constrain inherited directory ACLs.
-python3 - "$out" "$log" "$log.stderr" <<'PYMODE'
+python3 -I - "$out" "$log" "$log.stderr" <<'PYMODE'
 import os, sys
 for path in sys.argv[1:]:
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     os.close(fd)
 PYMODE
-scratch=$(mktemp -d "${TMPDIR:-/tmp}/codex-jobs.XXXXXXXX")
 registry=
 cancel_signal=0
 owned=0
@@ -74,8 +86,9 @@ trap cleanup EXIT
 trap '[[ $cancel_signal != 0 ]] || cancel_signal=15' TERM
 trap '[[ $cancel_signal != 0 ]] || cancel_signal=1' HUP
 trap '[[ $cancel_signal != 0 ]] || cancel_signal=2' INT
+trap '[[ $cancel_signal != 0 ]] || cancel_signal=3' QUIT
 cancel() {
-    trap '' TERM HUP INT
+    trap '' TERM HUP INT QUIT
     if [[ $owned == 1 ]]; then
         kill -TERM -- "-$pgid" 2>/dev/null || :
         sleep 10
@@ -94,9 +107,11 @@ setsid --wait bash -c '
         [[ -d $1 ]] && kill -0 "$2" 2>/dev/null || exit 1
         sleep 0.01
     done
-    shift 2
+    child_umask=$3
+    shift 3
+    umask "$child_umask"
     exec "$@"
-' bash "$scratch" "$$" "$exe" "${args[@]}" < "$prompt" > "$log" 2> "$log.stderr" &
+' bash "$scratch" "$$" "$caller_umask" "$exe" "${args[@]}" < "$prompt" > "$log" 2> "$log.stderr" &
 leader=$!
 # Signals only set cancel_signal here; never clean an unverified numeric group.
 for ((attempt=0; attempt<500; attempt++)); do
@@ -110,7 +125,7 @@ if [[ ! -s $scratch/pid ]]; then
     exit 1
 fi
 read -r pid < "$scratch/pid"
-pgid=$(trap '' INT; exec python3 - "$pid" <<'PY'
+pgid=$(trap '' INT; exec python3 -I - "$pid" <<'PY'
 import sys
 pid = int(sys.argv[1])
 with open('/proc/{}/stat'.format(pid)) as f:
@@ -124,7 +139,7 @@ PY
 owned=1
 [[ $cancel_signal == 0 ]] || cancel
 # Optional display publication: any failure warns but does not fail the job.
-if registry=$(python3 - "$model" "$effort" "$started" "$$" "$log" "$session" <<'PY'
+if registry=$(python3 -I - "$model" "$effort" "$started" "$$" "$log" "$session" <<'PY'
 import json, os, sys, uuid
 model, effort, started, pid, log, session = sys.argv[1:]
 base = os.environ.get('XDG_STATE_HOME') or os.path.expanduser('~/.local/state')
@@ -156,14 +171,14 @@ while :; do
     kill -0 "$leader" 2>/dev/null || break
 done
 # Leader has exited: finalization is now indivisible under catchable signals.
-trap '' TERM HUP INT
+trap '' TERM HUP INT QUIT
 kill -TERM -- "-$pgid" 2>/dev/null || :
 if kill -0 -- "-$pgid" 2>/dev/null; then
     sleep 10
     kill -KILL -- "-$pgid" 2>/dev/null || :
 fi
 if [[ $rc != 0 && -e $out ]]; then mv -f -- "$out" "$out.failed"; fi
-python3 - "$out.done" "$rc" "$started" <<'PY'
+python3 -I - "$out.done" "$rc" "$started" <<'PY'
 import datetime, json, os, sys, tempfile
 path, rc, started = sys.argv[1:]
 fd, temp = tempfile.mkstemp(prefix='.receipt-', dir=os.path.dirname(path))

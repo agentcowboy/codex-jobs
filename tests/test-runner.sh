@@ -8,7 +8,7 @@ cleanup() {
     for child in "${children[@]}"; do
         kill -KILL "$child" 2>/dev/null || :
     done
-    # Test fixtures may deliberately leave a resistant group after a mutation test.
+    # Test fixtures may leave processes that ignore TERM when checking broken code.
     python3 - "$work" <<'PY'
 import glob, os, signal, sys
 for path in glob.glob(sys.argv[1]+'/*/fake/ready') + glob.glob(sys.argv[1]+'/*/fake/descendant'):
@@ -124,7 +124,7 @@ case_readme_resume() {
     recipe=$(python3 - "$root/README.md" <<'PY'
 import sys
 with open(sys.argv[1]) as f:
-    lines = [line.rstrip('\n') for line in f if line.startswith('SESSION=$(python3 -c ')]
+    lines = [line.rstrip('\n') for line in f if line.startswith('SESSION=$(python3 -I -c ')]
 assert len(lines) == 1, 'one exact README session extractor'
 print(lines[0])
 PY
@@ -201,6 +201,124 @@ case_nonregular() {
     done
     pass
 }
+case_newline_alias() {
+    setup newline-alias
+    cp "$dir/prompt" "$dir/expected-prompt"
+    printf 'prior rotation\n' > "$dir/prompt.prev"
+    cp "$dir/prompt.prev" "$dir/expected-prev"
+    assert_rc 1 codex-hands --cwd "$dir/cwd" demo-model high "$dir/prompt" "$dir/prompt"$'\n' "$dir/log"
+    [[ $(< "$dir/stderr") == *'must not contain control characters'* ]] || fail 'newline refusal message'
+    cmp "$dir/prompt" "$dir/expected-prompt" || fail 'newline alias preserves prompt'
+    cmp "$dir/prompt.prev" "$dir/expected-prev" || fail 'newline alias preserves prior rotation'
+    [[ ! -e $dir/fake/argv.json && ! -e $dir/log && ! -e $dir/prompt.done && ! -e $dir/prompt$'\n'.done ]] || fail 'newline refusal before launch, mutation or receipt'
+    pass
+}
+case_dotdot_alias() {
+    setup dotdot-alias
+    mkdir -p "$dir/a/sub"
+    ln -s a/sub "$dir/link"
+    cp "$dir/prompt" "$dir/a/x"
+    printf 'unrelated output\n' > "$dir/x"
+    printf 'prior rotation\n' > "$dir/x.prev"
+    printf 'prior log\n' > "$dir/log"
+    for role in out log; do
+        local out=$dir/out log=$dir/log
+        case $role in out) out=link/../x;; log) log=link/../x;; esac
+        (cd -- "$dir"; assert_rc 1 codex-hands --cwd "$dir/cwd" demo-model high "$dir/a/x" "$out" "$log")
+        [[ $(< "$dir/stderr") == 'artifact alias refused' ]] || fail 'dotdot alias refusal message'
+        cmp "$dir/prompt" "$dir/a/x" || fail 'dotdot alias preserves prompt'
+        [[ $(< "$dir/x") == 'unrelated output' && $(< "$dir/x.prev") == 'prior rotation' && $(< "$dir/log") == 'prior log' ]] || fail 'dotdot alias preserves prior artifacts'
+        [[ ! -e $dir/fake/argv.json && ! -e $dir/out && ! -e $dir/log.prev && ! -e $dir/x.done ]] || fail 'dotdot alias before rotation, mutation or launch'
+    done
+    (cd -- "$dir"; assert_rc 0 codex-hands --cwd "$dir/cwd" demo-model high "$dir/prompt" link/../answer link/../events)
+    [[ -f $dir/a/answer && -f $dir/a/events && ! -e $dir/answer && ! -e $dir/events ]] || fail 'kernel-resolved artifacts used'
+    python3 - "$dir/fake/argv.json" "$dir/a/answer" <<'PYTEST'
+import json, os, sys
+with open(sys.argv[1]) as f: args = json.load(f)
+assert args[args.index('-o') + 1] == os.path.realpath(sys.argv[2]), 'validated output emitted to child'
+PYTEST
+    pass
+}
+case_control_paths() {
+    setup control-paths
+    printf 'prior output\n' > "$dir/out"
+    printf 'prior rotation\n' > "$dir/out.prev"
+    local role control prompt out log checked=0
+    # NUL cannot be represented in a shell argument; cover C0, DEL and C1 controls.
+    while IFS= read -r -d '' control; do
+        for role in prompt out log; do
+            prompt=$dir/prompt out=$dir/out log=$dir/log
+            case $role in prompt) prompt+=$control;; out) out+=$control;; log) log+=$control;; esac
+            assert_rc 1 codex-hands --cwd "$dir/cwd" demo-model high "$prompt" "$out" "$log"
+            checked=$((checked + 1))
+            [[ $(< "$dir/stderr") == *'must not contain control characters'* ]] || fail 'control refusal message'
+            [[ ! -e $dir/out.done && ! -e $dir/log && ! -e $dir/fake/argv.json ]] || fail 'control refusal before launch or receipt'
+            [[ $(< "$dir/out") == 'prior output' && $(< "$dir/out.prev") == 'prior rotation' ]] || fail 'control refusal preserves artifacts'
+        done
+    done < <(python3 -c 'import sys; sys.stdout.buffer.write(b"".join((chr(i)+"\0").encode() for i in list(range(1,32))+list(range(127,160))))')
+    [[ $checked == 192 ]] || fail 'all representable control characters checked for each path role'
+    pass
+}
+case_fd_prompts() {
+    setup fd-prompts
+    assert_rc 0 codex-hands --cwd "$dir/cwd" demo-model high /dev/stdin "$dir/out" "$dir/log" < "$dir/prompt"
+    assert_args fresh read-only; assert_receipt 0
+    assert_rc 0 codex-hands --cwd "$dir/cwd" demo-model high /dev/fd/3 "$dir/out" "$dir/log" 3< "$dir/prompt"
+    assert_args fresh read-only; assert_receipt 0
+    # Reopening a regular-file descriptor reads from the start, not its offset.
+    (
+        exec 3< "$dir/prompt"
+        read -r -n 10 <&3
+        assert_rc 0 codex-hands --cwd "$dir/cwd" demo-model high /dev/stdin "$dir/out" "$dir/log" <&3
+        assert_args fresh read-only; assert_receipt 0
+        assert_rc 0 codex-hands --cwd "$dir/cwd" demo-model high /dev/fd/3 "$dir/out" "$dir/log"
+        assert_args fresh read-only; assert_receipt 0
+    )
+    # The stdin alias must still be compared against the caller's regular file.
+    assert_rc 1 codex-hands --cwd "$dir/cwd" demo-model high /dev/stdin "$dir/prompt" "$dir/log" < "$dir/prompt"
+    [[ $(< "$dir/stderr") == 'artifact alias refused' ]] || fail 'stdin prompt alias refusal'
+    cmp "$dir/prompt" "$dir/fake/stdin" || fail 'stdin alias preserves prompt'
+    mv "$dir/cwd" "$dir/cwd"$'\n'
+    assert_rc 0 codex-hands --cwd "$dir/cwd"$'\n' demo-model high "$dir/prompt" "$dir/out" "$dir/log"
+    python3 - "$dir/fake/argv.json" "$dir/cwd"$'\n' <<'PYTEST'
+import json, os, sys
+with open(sys.argv[1]) as f: args = json.load(f)
+assert args[args.index("-C") + 1] == os.path.realpath(sys.argv[2]), 'cwd capture preserves trailing newline'
+PYTEST
+    pass
+}
+case_pipe_stdin() {
+    setup pipe-stdin
+    printf 'prior output\n' > "$dir/out"
+    printf 'prior rotation\n' > "$dir/out.prev"
+    printf x | assert_rc 1 codex-hands --cwd "$dir/cwd" demo-model high /dev/stdin "$dir/out" "$dir/log"
+    [[ $(< "$dir/stderr") == *'must be regular files'* ]] || fail 'pipe stdin refusal message'
+    [[ $(< "$dir/out") == 'prior output' && $(< "$dir/out.prev") == 'prior rotation' ]] || fail 'pipe stdin preserves artifacts'
+    [[ ! -e $dir/fake/argv.json && ! -e $dir/out.done && ! -e $dir/log ]] || fail 'pipe stdin before rotation, mutation or launch'
+    pass
+}
+case_cdpath() {
+    setup cdpath
+    mkdir -p "$dir/search/cwd"
+    (
+        cd -- "$dir"
+        export CDPATH=$dir/search
+        assert_rc 0 codex-hands --cwd cwd demo-model high "$dir/prompt" "$dir/out" "$dir/log"
+        assert_args fresh read-only; assert_receipt 0
+        [[ ! -s $dir/stdout ]] || fail 'CDPATH does not print a directory'
+    )
+    pass
+}
+case_isolated_python() {
+    setup isolated-python
+    for module in unicodedata json uuid datetime; do
+        printf 'raise RuntimeError("caller module imported")\n' > "$dir/$module.py"
+    done
+    (cd -- "$dir"; assert_rc 0 invoke)
+    assert_args fresh read-only; assert_receipt 0
+    [[ ! -d $dir/__pycache__ ]] || fail 'caller modules were not imported'
+    pass
+}
 case_missing_directory() {
     setup missing-directory
     assert_rc 2 codex-hands --cwd "$dir/cwd" demo-model high "$dir/prompt" "$dir/missing/out" "$dir/log"
@@ -214,8 +332,8 @@ case_abandoned_launch() {
     export REAL_PYTHON=$real_python
     cat > "$dir/shim/python3" <<'SH'
 #!/usr/bin/env bash
-if [[ $# == 2 && $1 == - && $2 =~ ^[0-9]+$ ]]; then
-    printf '%s\n' "$2" > "$FAKE_DIR/ready"
+if [[ $# == 3 && $1 == -I && $2 == - && $3 =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$3" > "$FAKE_DIR/ready"
     while [[ ! -e $FAKE_DIR/release ]]; do sleep 0.01; done
     exit 1
 fi
@@ -249,6 +367,35 @@ for name in ('out', 'log', 'log.stderr', 'out.done'):
 PY
     chmod 0644 "$dir/out"; invoke
     [[ $(stat -c %a "$dir/out.prev") == 644 ]] || fail 'existing output permissions preserved'
+    pass
+}
+case_caller_umask() {
+    setup caller-umask
+    python3 -I - "$dir/cwd" <<'PY'
+import errno, os, sys
+try:
+    os.removexattr(sys.argv[1], 'system.posix_acl_default')
+except OSError as exc:
+    if exc.errno not in (errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP):
+        raise
+PY
+    (umask 022; assert_rc 0 invoke --sandbox workspace-write)
+    [[ $(stat -c %a "$dir/cwd/created.txt") == 644 ]] || fail 'Codex repo file uses caller umask'
+    for artifact in out log log.stderr out.done; do
+        [[ $(stat -c %a "$dir/$artifact") == 600 ]] || fail 'artifacts stay private'
+    done
+    pass
+}
+case_bad_tmpdir() {
+    setup bad-tmpdir; assert_rc 0 invoke
+    for artifact in out log log.stderr out.done; do cp "$dir/$artifact" "$dir/$artifact.expected"; done
+    local got=0
+    TMPDIR="$dir/missing" invoke > "$dir/stdout" 2> "$dir/stderr" || got=$?
+    [[ $got != 0 ]] || fail 'invalid TMPDIR fails'
+    for artifact in out log log.stderr out.done; do
+        cmp "$dir/$artifact" "$dir/$artifact.expected" || fail 'invalid TMPDIR preserves prior artifacts and receipt'
+    done
+    [[ ! -e $dir/out.prev && ! -e $dir/log.prev ]] || fail 'invalid TMPDIR before rotation'
     pass
 }
 case_registry() {
@@ -292,7 +439,7 @@ case_registry_failure() {
 case_term() {
     setup term; export FAKE_HANG=1 FAKE_IGNORE_TERM=1 FAKE_DESCENDANT=1; start_job
     began=$(now); kill -TERM "$wrapper"; sleep 0.2; kill -HUP "$wrapper"; kill -TERM "$wrapper"
-    # Assert escalation independently of wait: removing KILL must fail behaviorally.
+    # Check the processes before waiting so a missing KILL is caught.
     sleep 10.1; assert_dead
     got=0; wait "$wrapper" || got=$?
     [[ $got == 143 && ! -e $dir/out.done ]] || fail 'TERM rc and no cancellation receipt'
@@ -322,6 +469,26 @@ try:
     assert p.wait(timeout=12) == 130, 'qualified INT rc'
     assert 9.8 <= time.monotonic()-began <= 12, 'qualified INT cancellation bound'
     assert not os.path.exists(root+'/out.done'), 'INT no receipt'
+finally:
+    if p.poll() is None: p.kill(); p.wait()
+PY
+    assert_dead; pass
+}
+case_quit() {
+    setup quit; export FAKE_HANG=1 FAKE_IGNORE_TERM=1
+    python3 - "$dir" <<'PY'
+import os, signal, subprocess, sys, time
+root = sys.argv[1]
+p = subprocess.Popen(['codex-hands','--cwd',root+'/cwd','demo-model','high',root+'/prompt',root+'/out',root+'/log'], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, preexec_fn=lambda: signal.signal(signal.SIGQUIT, signal.SIG_DFL))
+try:
+    deadline = time.monotonic()+5
+    while not (os.path.exists(root+'/fake/activity') and os.path.getsize(root+'/fake/activity')):
+        assert time.monotonic() < deadline, 'QUIT readiness/activity check'
+        time.sleep(.01)
+    began = time.monotonic(); p.send_signal(signal.SIGQUIT)
+    assert p.wait(timeout=12) == 131, 'qualified QUIT rc'
+    assert 9.8 <= time.monotonic()-began <= 12, 'qualified QUIT cancellation bound'
+    assert not os.path.exists(root+'/out.done'), 'QUIT no receipt'
 finally:
     if p.poll() is None: p.kill(); p.wait()
 PY
@@ -429,9 +596,18 @@ case_failure
 case_retry
 case_alias
 case_nonregular
+case_newline_alias
+case_dotdot_alias
+case_control_paths
+case_fd_prompts
+case_pipe_stdin
+case_cdpath
+case_isolated_python
 case_missing_directory
 case_abandoned_launch
 case_permissions
+case_caller_umask
+case_bad_tmpdir
 case_registry
 case_registry_failure
 case_resume_registry
@@ -439,9 +615,10 @@ case_registry_cleanup_warning
 case_term
 case_hup
 case_int
+case_quit
 case_launch_cancel
 case_forked_setsid
 case_descendants
 case_late_signal
-[[ $cases == 24 ]] || fail "runner executed case count: expected 24 got $cases"
+[[ $cases == 34 ]] || fail "runner executed case count: expected 34 got $cases"
 printf 'RUNNER cases=%s passed=%s failures=0 skips=0\n' "$cases" "$cases"

@@ -56,6 +56,11 @@ class ViewTests(unittest.TestCase):
         self.assertIn('turn failure', output)
         self.assertIn('earlier error', output)
 
+    def test_null_failure_shows_unknown_error(self):
+        self.write(event('turn.failed', error=None))
+        self.assertEqual(self.f.status, 'failed')
+        self.assertIn('turn.failed: unknown error', self.f.detail)
+
     def test_command_output_omitted(self):
         self.write(event('item.completed', item=dict(id='a', type='command_execution',
                          command='echo visible-command', aggregated_output='hidden-body')))
@@ -138,6 +143,24 @@ class ViewTests(unittest.TestCase):
         self.assertEqual(self.f.input_state,'unreadable')
         self.assertEqual(self.f.status,'waiting')
 
+    def test_unreadable_inputs_and_vanished_descriptor(self):
+        for path in ('bad\x00path', 'bad\ud800path'):
+            with self.subTest(path=repr(path)):
+                follower=view.Follower(path)
+                try:
+                    follower.refresh()
+                except (ValueError, UnicodeError):
+                    self.fail('path error escaped refresh')
+                self.assertEqual(follower.input_state,'unreadable')
+        descriptor=self.root/'vanished.json'
+        descriptor.write_text(json.dumps(self.descriptor()))
+        entries=list(os.scandir(self.root))
+        descriptor.unlink()
+        with patch.object(view.os,'scandir',return_value=entries):
+            self.assertEqual(view.roster(str(self.root)),('empty',[]))
+        descriptor.symlink_to(self.root/'absent')
+        self.assertEqual(view.roster(str(self.root))[1][0]['state'],'unreadable')
+
     def test_registry_states(self):
         self.assertEqual(view.roster(str(self.root/'absent'))[0],'unavailable')
         self.assertEqual(view.roster(str(self.root))[0],'empty')
@@ -155,6 +178,38 @@ class ViewTests(unittest.TestCase):
             return real_open(path,*args,**kwargs)
         with patch('builtins.open',side_effect=denied):
             self.assertEqual(view.roster(str(self.root))[1][0]['state'],'unreadable')
+
+    def test_fifo_descriptor(self):
+        os.mkfifo(str(self.root/'fifo.json'))
+        result=subprocess.run([str(ROOT/'bin/codex-view'),'--once','--registry',str(self.root)],
+                              stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=2)
+        self.assertEqual(result.returncode,0,result.stderr.decode())
+        self.assertIn(b'fifo.json',result.stdout)
+        self.assertIn(b'malformed',result.stdout)
+
+    def test_fifo_log(self):
+        os.mkfifo(str(self.path))
+        result=subprocess.run([str(ROOT/'bin/codex-view'),'--once','--log',str(self.path)],
+                              stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=2)
+        self.assertEqual(result.returncode,0,result.stderr.decode())
+        self.assertIn(b'unreadable',result.stdout)
+        # Registry-selected logs use the same guard as explicit logs.
+        (self.root/'demo.json').write_text(json.dumps(self.descriptor()))
+        result=subprocess.run([str(ROOT/'bin/codex-view'),'--once','--registry',str(self.root)],
+                              stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=2)
+        self.assertEqual(result.returncode,0,result.stderr.decode())
+        self.assertIn(b'unreadable',result.stdout)
+
+    def test_fifo_rejected_before_open(self):
+        os.mkfifo(str(self.path))
+        os.mkfifo(str(self.root/'fifo.json'))
+        with patch('builtins.open',wraps=open) as builtin_open, \
+             patch.object(view.os,'open',wraps=os.open) as raw_open:
+            self.f.refresh()
+            self.assertEqual(self.f.input_state,'unreadable')
+            self.assertEqual(view.roster(str(self.root))[1][0]['state'],'malformed')
+            builtin_open.assert_not_called()
+            raw_open.assert_not_called()
 
     def test_registry_deeply_nested(self):
         (self.root/'deep.json').write_text('['*1100+'0'+']'*1100)
@@ -219,6 +274,13 @@ class ViewTests(unittest.TestCase):
         self.assertIn(b'failed',result.stdout)
         self.assertNotIn(b'boot_id',result.stdout)
 
+    def test_log_and_registry_are_exclusive(self):
+        result=subprocess.run([sys.executable,str(ROOT/'bin/codex-view'),'--once','--log',str(self.path),
+                               '--registry',str(self.root)],stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE)
+        self.assertEqual(result.returncode,2)
+        self.assertIn(b'not allowed with argument',result.stderr)
+
     def test_control_characters_sanitized(self):
         controls=''.join(chr(i) for i in list(range(32))+list(range(127,160)))
         self.write(event('item.completed',item=dict(id='a',type='agent_message',
@@ -257,7 +319,7 @@ class ViewTests(unittest.TestCase):
 if __name__ == '__main__':
     suite=unittest.defaultTestLoader.loadTestsFromTestCase(ViewTests)
     result=unittest.TextTestRunner(stream=sys.stderr,verbosity=1).run(suite)
-    if result.testsRun != 24 or result.skipped or not result.wasSuccessful():
-        sys.stderr.write('ASSERTION: viewer executed case count=24, zero failures/errors/skips required; actual={} skips={}\n'.format(result.testsRun,len(result.skipped)))
+    if result.testsRun != 30 or result.skipped or not result.wasSuccessful():
+        sys.stderr.write('ASSERTION: viewer executed case count=30, zero failures/errors/skips required; actual={} skips={}\n'.format(result.testsRun,len(result.skipped)))
         sys.exit(1)
     print('VIEW cases={} passed={} failures=0 skips=0'.format(result.testsRun,result.testsRun))

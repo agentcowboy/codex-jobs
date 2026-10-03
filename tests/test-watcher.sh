@@ -39,6 +39,7 @@ assert_viewer() {
     python3 - "$socket" "$pane" "$root/bin/codex-view" "$expected_python" <<'PY'
 import os, subprocess, sys, time
 socket, pane, viewer, interpreter = sys.argv[1:]
+viewer, interpreter = map(os.path.abspath, (viewer, interpreter))
 deadline = time.monotonic()+5
 while True:
     state = subprocess.check_output(['tmux','-S',socket,'display-message','-p','-t',pane,
@@ -60,6 +61,10 @@ PY
 
 case_start() {
     python3 -m venv --without-pip --system-site-packages "$work/venv"
+    local rich_dir venv_site
+    rich_dir=$(python3 -I -c 'import os,rich; print(os.path.dirname(os.path.dirname(rich.__file__)))')
+    venv_site=$("$work/venv/bin/python3" -I -c 'import sysconfig; print(sysconfig.get_path("purelib"))')
+    printf '%s\n' "$rich_dir" > "$venv_site/outer-rich.pth"
     pane=$(PATH="$work/venv/bin:$PATH" codex-watcher start)
     [[ $(tmux -S "$socket" display-message -p -t "$pane" '#{@codex-jobs-view}') == 1 ]] || fail 'viewer marked'
     assert_viewer "$pane" "$work/venv/bin/python3"; assert_other; pass
@@ -89,9 +94,9 @@ case_dependencies() {
     assert_other; pass
 }
 case_restart_dead() {
-    tmux -S "$socket" set-option -w -t "$window" remain-on-exit on
-    dead=$(tmux -S "$socket" split-window -d -v -t "$window" -P -F '#{pane_id}' 'exit 0')
-    tmux -S "$socket" set-option -p -t "$dead" @codex-jobs-view 1
+    dead=$(codex-watcher start)
+    assert_viewer "$dead"
+    kill -TERM "$(tmux -S "$socket" display-message -p -t "$dead" '#{pane_pid}')"
     sleep 0.2
     [[ $(tmux -S "$socket" display-message -p -t "$dead" '#{pane_dead}') == 1 ]] || fail 'dead-pane fixture'
     pane=$(codex-watcher start)
@@ -100,10 +105,42 @@ case_restart_dead() {
     assert_viewer "$pane"; assert_other
     codex-watcher stop; assert_other; pass
 }
+case_pane_safety() {
+    local copy=$work/$'viewer\tcopy' height
+    mkdir -p "$copy"; cp "$root/bin/codex-watcher" "$root/bin/codex-view" "$copy/"
+    tmux -S "$socket" set-option -g default-shell /bin/sh
+    height=$(tmux -S "$socket" display-message -p -t "$control" '#{pane_height}')
+    pane=$(cd -- "$work"; PATH="venv/bin:$PATH" "$copy/codex-watcher" start)
+    python3 - "$socket" "$pane" "$copy/codex-view" "$work/venv/bin/python3" <<'PY'
+import os, subprocess, sys, time
+socket, pane, viewer, interpreter = sys.argv[1:]
+viewer, interpreter = map(os.path.abspath, (viewer, interpreter))
+for _ in range(250):
+    pid = subprocess.check_output(['tmux', '-S', socket, 'display-message', '-p', '-t', pane, '#{pane_pid}']).decode().strip()
+    try:
+        with open('/proc/'+pid+'/cmdline', 'rb') as f: args = f.read().split(b'\0')
+        if args[:2] == [interpreter.encode(), viewer.encode()]: break
+    except FileNotFoundError: pass
+    time.sleep(.02)
+else: raise AssertionError('viewer starts under /bin/sh with literal path and absolute Python')
+PY
+    [[ $(tmux -S "$socket" display-message -p -t "$control" '#{pane_height}') == "$height" ]] || fail 'split belongs to caller pane'
+    [[ $(tmux -S "$socket" show-options -p -v -t "$pane" remain-on-exit) == on ]] || fail 'viewer exit stays visible'
+    [[ -z $(tmux -S "$socket" show-options -p -v -t "$caller" remain-on-exit) ]] || fail 'caller exit policy unchanged'
+    tmux -S "$socket" set-option -w -t "$window" @codex-jobs-view 1
+    tmux -S "$socket" set-option -p -t "$caller" @codex-jobs-view 1
+    codex-watcher stop
+    if pane_exists "$pane"; then fail 'marked viewer removed'; fi
+    assert_other
+    tmux -S "$socket" set-option -p -u -t "$caller" @codex-jobs-view
+    tmux -S "$socket" set-option -w -u -t "$window" @codex-jobs-view
+    pass
+}
 case_start
 case_reuse
 case_stop
 case_dependencies
+case_pane_safety
 case_restart_dead
-[[ $cases == 5 ]] || fail "watcher executed case count: expected 5 got $cases"
+[[ $cases == 6 ]] || fail "watcher executed case count: expected 6 got $cases"
 printf 'WATCHER cases=%s passed=%s failures=0 skips=0\n' "$cases" "$cases"

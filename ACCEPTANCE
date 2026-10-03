@@ -24,9 +24,9 @@ run_suite() {
     total=$((total+BASH_REMATCH[1]))
 }
 total=0
-run_suite RUNNER 24 bash "$root/tests/test-runner.sh"
-run_suite VIEW 24 python3 -B "$root/tests/test-view.py"
-run_suite WATCHER 5 bash "$root/tests/test-watcher.sh"
-[[ $total == 53 ]] || { echo 'ASSERTION: expected 53 executed cases' >&2; exit 1; }
+run_suite RUNNER 34 bash "$root/tests/test-runner.sh"
+run_suite VIEW 30 python3 -B "$root/tests/test-view.py"
+run_suite WATCHER 6 bash "$root/tests/test-watcher.sh"
+[[ $total == 70 ]] || { echo 'ASSERTION: expected 70 executed cases' >&2; exit 1; }
 printf 'CODEX_JOBS TESTS cases=%s passed=%s failures=0 skips=0\n' "$total" "$total"
 echo 'CODEX_JOBS ACCEPTANCE PASS'

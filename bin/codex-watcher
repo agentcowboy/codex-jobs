@@ -8,14 +8,16 @@ action=${1:-start}
 # Window IDs are unambiguous even if another window has the same name/index.
 [[ -n ${TMUX_PANE:-} ]] || { echo 'caller pane is unavailable' >&2; exit 2; }
 window=$(tmux display-message -p -t "$TMUX_PANE" '#{window_id}')
-mapfile -t marked < <(tmux list-panes -t "$window" -F '#{pane_id} #{@codex-jobs-view}' | awk '$2 == "1" {print $1}')
+mapfile -t marked < <(while read -r pane; do
+    [[ $pane != "$TMUX_PANE" && $(tmux show-options -p -q -v -t "$pane" @codex-jobs-view) == 1 ]] && echo "$pane"
+done < <(tmux list-panes -t "$window" -F '#{pane_id}'))
 if [[ $action == stop ]]; then
     for pane in "${marked[@]}"; do tmux kill-pane -t "$pane"; done
     exit 0
 fi
-viewer=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/codex-view
+viewer=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/codex-view
 [[ -x $viewer ]] || { echo 'viewer is unavailable' >&2; exit 2; }
-python3 -c 'import rich' 2>/dev/null || { echo 'Rich is required: install requirements.txt' >&2; exit 2; }
+python=$(python3 -I -c 'import os,rich,sys; print(os.path.abspath(sys.executable))') || { echo 'Rich is required: install requirements.txt' >&2; exit 2; }
 for pane in "${marked[@]}"; do
     if [[ $(tmux display-message -p -t "$pane" '#{pane_dead}') == 0 ]]; then
         echo "$pane"
@@ -23,8 +25,8 @@ for pane in "${marked[@]}"; do
     fi
     tmux kill-pane -t "$pane"
 done
-registry=$(python3 -c 'import os; base=os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"); print(os.path.abspath(os.path.join(base, "codex-jobs", "active")))')
-printf -v command 'exec %q %q --registry %q' "$(command -v python3)" "$viewer" "$registry"
-pane=$(tmux split-window -d -v -t "$window" -P -F '#{pane_id}' "$command")
+registry=$(python3 -I -c 'import os; base=os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"); print(os.path.abspath(os.path.join(base, "codex-jobs", "active")))')
+pane=$(tmux split-window -d -v -t "$TMUX_PANE" -P -F '#{pane_id}' "$python" "$viewer" --registry "$registry")
 tmux set-option -p -t "$pane" @codex-jobs-view 1
+tmux set-option -p -t "$pane" remain-on-exit on
 echo "$pane"
