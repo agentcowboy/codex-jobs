@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+"""Synthetic Codex: argv/stdin receipts, events, activity and lifecycle controls."""
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+
+root = os.environ['FAKE_DIR']
+args = sys.argv[1:]
+with open(os.path.join(root, 'argv.json'), 'w') as f:
+    json.dump(args, f)
+with open(os.path.join(root, 'stdin'), 'wb') as f:
+    f.write(sys.stdin.buffer.read())
+if os.environ.get('FAKE_IGNORE_TERM') == '1':
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+if os.environ.get('FAKE_DESCENDANT') == '1':
+    code = '''import os, signal, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+with open(sys.argv[1], 'w') as f: f.write(str(os.getpid()))
+while True:
+    with open(sys.argv[2], 'a') as f: f.write('.')
+    time.sleep(0.05)
+'''
+    subprocess.Popen([sys.executable, '-c', code, os.path.join(root, 'descendant'),
+                      os.path.join(root, 'descendant-activity')])
+with open(os.path.join(root, 'ready'), 'w') as f:
+    f.write(str(os.getpid()))
+print(json.dumps(dict(type='thread.started', thread_id='demo-session')), flush=True)
+print('synthetic diagnostic', file=sys.stderr, flush=True)
+if '-o' in args:
+    with open(args[args.index('-o') + 1], 'w') as f:
+        f.write('synthetic answer\n')
+if os.environ.get('FAKE_HANG') == '1':
+    while not os.path.exists(os.path.join(root, 'finish')):
+        with open(os.path.join(root, 'activity'), 'a') as f:
+            f.write('.')
+        time.sleep(0.05)
+rc = int(os.environ.get('FAKE_RC', '0'))
+print(json.dumps(dict(type='turn.failed' if rc else 'turn.completed',
+                      error=dict(message='synthetic failure') if rc else None)), flush=True)
+sys.exit(rc)

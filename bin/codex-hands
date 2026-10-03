@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# Foreground Linux supervisor. The launch handshake establishes group ownership.
+set -euo pipefail
+set +m
+umask 077
+usage() { echo 'usage: codex-hands [resume] --cwd DIR [--sandbox read-only|workspace-write] [SESSION] MODEL EFFORT PROMPT-FILE OUT-FILE [RUNLOG]' >&2; exit 2; }
+mode=fresh
+if [[ ${1:-} == resume ]]; then mode=resume; shift; fi
+cwd= sandbox=read-only
+while [[ ${1:-} == --* ]]; do
+    case $1 in
+        --cwd) [[ $# -ge 2 ]] || usage; cwd=$2; shift 2 ;;
+        --sandbox) [[ $# -ge 2 ]] || usage; sandbox=$2; shift 2 ;;
+        *) usage ;;
+    esac
+done
+[[ -n $cwd && -d $cwd ]] || usage
+[[ $sandbox == read-only || $sandbox == workspace-write ]] || usage
+session=
+if [[ $mode == resume ]]; then [[ $# -ge 1 ]] || usage; session=$1; shift; fi
+[[ $# -eq 4 || $# -eq 5 ]] || usage
+model=$1 effort=$2 prompt=$3 out=$4 log=${5:-$4.jsonl}
+[[ -n $model && $model != -* && -n $effort && $effort != -* ]] || usage
+[[ $mode != resume || ( -n $session && $session != -* ) ]] || usage
+[[ -f $prompt && -r $prompt ]] || { echo 'prompt is unavailable' >&2; exit 2; }
+command -v python3 >/dev/null || { echo 'python3 is required' >&2; exit 2; }
+command -v setsid >/dev/null || { echo 'setsid is required' >&2; exit 2; }
+exe=${CODEX_BIN:-codex}
+command -v "$exe" >/dev/null || { echo 'Codex executable is unavailable' >&2; exit 2; }
+# Refuse aliases across inputs, artifacts and rotation destinations before mutation.
+python3 - "$prompt" "$out" "$log" <<'PY'
+import os, sys
+prompt, out, log = sys.argv[1:]
+paths = [prompt, out, log, log+'.stderr', out+'.done', out+'.prev',
+         out+'.failed', log+'.prev', log+'.stderr.prev']
+for i, path in enumerate(paths):
+    if i and (os.path.islink(path) or os.path.isdir(path)):
+        sys.exit('artifact must be a regular file, not a symlink or directory')
+    for other in paths[:i]:
+        if os.path.realpath(path) == os.path.realpath(other) or (
+            os.path.exists(path) and os.path.exists(other) and os.path.samefile(path, other)):
+            sys.exit('artifact alias refused')
+PY
+cwd=$(cd -- "$cwd" && pwd -P)
+out=$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$out")
+log=$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$log")
+rm -f -- "$out.done"
+for file in "$out" "$log" "$log.stderr"; do
+    [[ ! -e $file ]] || mv -f -- "$file" "$file.prev"
+done
+# Explicit creation modes also constrain inherited directory ACLs.
+python3 - "$out" "$log" "$log.stderr" <<'PYMODE'
+import os, sys
+for path in sys.argv[1:]:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(fd)
+PYMODE
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/codex-jobs.XXXXXXXX")
+registry=
+cancel_signal=0
+owned=0
+pid= pgid= leader=
+cleanup() {
+    if [[ -n $registry ]]; then
+        rm -f -- "$registry" || echo 'warning: registry removal failed' >&2
+    fi
+    rm -rf -- "$scratch"
+}
+trap cleanup EXIT
+trap '[[ $cancel_signal != 0 ]] || cancel_signal=15' TERM
+trap '[[ $cancel_signal != 0 ]] || cancel_signal=1' HUP
+trap '[[ $cancel_signal != 0 ]] || cancel_signal=2' INT
+cancel() {
+    trap '' TERM HUP INT
+    if [[ $owned == 1 ]]; then
+        kill -TERM -- "-$pgid" 2>/dev/null || :
+        sleep 10
+        kill -KILL -- "-$pgid" 2>/dev/null || :
+        wait "$leader" 2>/dev/null || :
+    fi
+    exit "$((128 + cancel_signal))"
+}
+started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+args=(exec -C "$cwd" --sandbox "$sandbox" -c 'approval_policy="never"' -m "$model" -c "model_reasoning_effort=$effort")
+[[ $mode != resume ]] || args+=(resume "$session")
+args+=(--json -o "$out" -)
+setsid --wait bash -c '
+    printf "%s\n" "$$" > "$1/pid"
+    while [[ ! -e $1/go ]]; do sleep 0.01; done
+    shift
+    exec "$@"
+' bash "$scratch" "$exe" "${args[@]}" < "$prompt" > "$log" 2> "$log.stderr" &
+leader=$!
+# Signals only set cancel_signal here; never clean an unverified numeric group.
+for ((attempt=0; attempt<500; attempt++)); do
+    [[ ! -s $scratch/pid ]] || break
+    sleep 0.01 || :
+done
+if [[ ! -s $scratch/pid ]]; then
+    echo 'launch handshake failed' >&2
+    kill -TERM "$leader" 2>/dev/null || :
+    wait "$leader" 2>/dev/null || :
+    exit 1
+fi
+read -r pid < "$scratch/pid"
+pgid=$(trap '' INT; exec python3 - "$pid" <<'PY'
+import sys
+pid = int(sys.argv[1])
+with open('/proc/{}/stat'.format(pid)) as f:
+    fields = f.read().rsplit(')', 1)[1].split()
+group = int(fields[2])
+if group != pid:
+    sys.exit('launch group ownership failed')
+print(group)
+PY
+)
+owned=1
+[[ $cancel_signal == 0 ]] || cancel
+# Optional display publication: any failure warns but does not fail the job.
+if registry=$(python3 - "$model" "$effort" "$started" "$$" "$log" "$session" <<'PY'
+import json, os, sys, uuid
+model, effort, started, pid, log, session = sys.argv[1:]
+base = os.environ.get('XDG_STATE_HOME') or os.path.expanduser('~/.local/state')
+directory = os.path.join(base, 'codex-jobs', 'active')
+os.makedirs(directory, mode=0o700, exist_ok=True)
+os.chmod(os.path.dirname(directory), 0o700)
+os.chmod(directory, 0o700)
+with open('/proc/{}/stat'.format(pid)) as f:
+    start = int(f.read().rsplit(')', 1)[1].split()[19])
+with open('/proc/sys/kernel/random/boot_id') as f:
+    boot = f.read().strip()
+job = str(uuid.uuid4())
+path = os.path.join(directory, job+'.json')
+data = dict(schema=1, job_id=job, model=model, effort=effort, started_at=started,
+            pid=int(pid), pid_start=start, boot_id=boot, runlog=log,
+            session_id=session or None)
+with open(path, 'x') as f:
+    os.chmod(path, 0o600)
+    json.dump(data, f)
+print(path)
+PY
+); then :; else registry=; echo 'warning: registry publication failed' >&2; fi
+[[ $cancel_signal == 0 ]] || cancel
+: > "$scratch/go"
+rc=0
+while :; do
+    wait "$leader" && rc=0 || rc=$?
+    [[ $cancel_signal == 0 ]] || cancel
+    kill -0 "$leader" 2>/dev/null || break
+done
+# Leader has exited: finalization is now indivisible under catchable signals.
+trap '' TERM HUP INT
+kill -TERM -- "-$pgid" 2>/dev/null || :
+if kill -0 -- "-$pgid" 2>/dev/null; then
+    sleep 10
+    kill -KILL -- "-$pgid" 2>/dev/null || :
+fi
+if [[ $rc != 0 && -e $out ]]; then mv -f -- "$out" "$out.failed"; fi
+python3 - "$out.done" "$rc" "$started" <<'PY'
+import datetime, json, os, sys, tempfile
+path, rc, started = sys.argv[1:]
+fd, temp = tempfile.mkstemp(prefix='.receipt-', dir=os.path.dirname(path))
+try:
+    with os.fdopen(fd, 'w') as f:
+        json.dump(dict(rc=int(rc), started_at=started,
+                       ended_at=datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')), f)
+        f.write('\n')
+    os.replace(temp, path)
+finally:
+    if os.path.exists(temp):
+        os.unlink(temp)
+PY
+exit "$rc"

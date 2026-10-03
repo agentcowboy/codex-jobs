@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+export PYTHONDONTWRITEBYTECODE=1
+command -v tmux >/dev/null || { echo 'tmux is required for acceptance' >&2; exit 1; }
+python3 -c 'import rich' 2>/dev/null || { echo 'Rich is required: install requirements.txt' >&2; exit 1; }
+work=$(mktemp -d "${TMPDIR:-/tmp}/acceptance.XXXXXXXX")
+trap 'rm -rf -- "$work"' EXIT
+export HOME=$work/home TMPDIR=$work/tmp XDG_STATE_HOME=$work/state
+mkdir -p "$HOME" "$TMPDIR" "$XDG_STATE_HOME"
+run_suite() {
+    local name=$1 expected=$2; shift 2
+    if ! "$@" > "$work/$name.out" 2> "$work/$name.err"; then
+        cat "$work/$name.out" "$work/$name.err" >&2
+        echo "ASSERTION: $name suite failed" >&2
+        exit 1
+    fi
+    [[ $(cat "$work/$name.out") == "$name cases=$expected passed=$expected failures=0 skips=0" ]] || {
+        echo "ASSERTION: $name executed count or summary mismatch" >&2; exit 1;
+    }
+    local summary
+    summary=$(cat "$work/$name.out")
+    [[ $summary =~ cases=([0-9]+) ]] || { echo 'ASSERTION: executed count missing' >&2; exit 1; }
+    total=$((total+BASH_REMATCH[1]))
+}
+total=0
+run_suite RUNNER 20 bash "$root/tests/test-runner.sh"
+run_suite VIEW 23 python3 -B "$root/tests/test-view.py"
+run_suite WATCHER 5 bash "$root/tests/test-watcher.sh"
+[[ $total == 48 ]] || { echo 'ASSERTION: expected 48 executed cases' >&2; exit 1; }
+printf 'CODEX_JOBS TESTS cases=%s passed=%s failures=0 skips=0\n' "$total" "$total"
+echo 'CODEX_JOBS ACCEPTANCE PASS'

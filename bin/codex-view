@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""Bounded JSONL follower and terminal roster; no pane management."""
+import argparse
+from collections import deque, OrderedDict
+import errno
+import json
+import os
+import re
+import select
+import shutil
+import sys
+import termios
+import time
+import tty
+
+try:
+    from rich.console import Console
+    from rich.live import Live
+    from rich.text import Text
+except ImportError:
+    sys.exit('Rich is required: install requirements.txt')
+
+READ_CAP = 1024 * 1024
+RECORD_CAP = 256 * 1024
+DETAIL_CAP = 200
+INFLIGHT_CAP = 256
+
+
+def pid_start(text):
+    """Linux field 22, after comm's final closing parenthesis."""
+    return int(text.rsplit(')', 1)[1].split()[19])
+
+
+def identity(data):
+    try:
+        with open('/proc/sys/kernel/random/boot_id') as f:
+            if f.read().strip() != data['boot_id']:
+                return 'stale'
+    except OSError:
+        return 'unknown'
+    try:
+        with open('/proc/{}/stat'.format(data['pid'])) as f:
+            if pid_start(f.read()) != data['pid_start']:
+                return 'stale'
+    except OSError as exc:
+        return 'stale' if exc.errno == errno.ENOENT else 'unknown'
+    except (ValueError, IndexError):
+        return 'unknown'
+    return 'active'
+
+
+def registry_dir():
+    base = os.environ.get('XDG_STATE_HOME') or os.path.expanduser('~/.local/state')
+    return os.path.join(base, 'codex-jobs', 'active')
+
+
+def roster(directory):
+    try:
+        entries = sorted(os.scandir(directory), key=lambda e: e.name)
+    except FileNotFoundError:
+        return 'unavailable', []
+    except OSError:
+        return 'unreadable', []
+    jobs = []
+    for entry in entries:
+        if not entry.name.endswith('.json'):
+            continue
+        try:
+            with open(entry.path, 'rb') as f:
+                raw = f.read(RECORD_CAP + 1)
+            if len(raw) > RECORD_CAP:
+                raise ValueError()
+            data = json.loads(raw)
+            required = ('job_id', 'model', 'effort', 'started_at', 'boot_id', 'runlog')
+            if (data.get('schema') != 1 or
+                    any(not isinstance(data.get(k), str) for k in required) or
+                    type(data.get('pid')) is not int or data['pid'] <= 0 or
+                    type(data.get('pid_start')) is not int or
+                    not os.path.isabs(data['runlog']) or
+                    not (data.get('session_id') is None or
+                         isinstance(data.get('session_id'), str))):
+                raise ValueError()
+            data['state'] = identity(data)
+            jobs.append(data)
+        except OSError:
+            jobs.append(dict(job_id=entry.name, state='unreadable'))
+        except (ValueError, TypeError, AttributeError):
+            jobs.append(dict(job_id=entry.name, state='malformed'))
+    return ('available' if jobs else 'empty'), jobs
+
+
+class Follower:
+    def __init__(self, path):
+        self.path = path
+        self.offset = 0
+        self.file_id = None
+        self.partial = b''
+        self.discard = False
+        self.detail = deque(maxlen=DETAIL_CAP)
+        self.inflight = OrderedDict()
+        self.evicted = 0
+        self.status = 'waiting'
+        self.input_state = 'unavailable'
+        self.failed = False
+        self.bytes_read = 0
+
+    def note(self, value):
+        self.detail.append(str(value))
+
+    def event(self, data):
+        if not isinstance(data, dict):
+            self.note('[malformed record]')
+            self.input_state = 'malformed'
+            return
+        kind = data.get('type')
+        if kind in ('error', 'turn.failed'):
+            self.failed = True
+            self.status = 'failed'
+            error = data.get('error', data.get('message', 'unknown error'))
+            if isinstance(error, dict):
+                error = error.get('message', 'unknown error')
+            self.note('{}: {}'.format(kind, error))
+        elif kind == 'turn.completed':
+            self.status = 'completed (earlier error)' if self.failed else 'completed'
+        elif kind in ('thread.started', 'turn.started'):
+            self.status = 'running'
+        elif kind in ('item.started', 'item.updated', 'item.completed'):
+            item = data.get('item')
+            if not isinstance(item, dict):
+                self.note('[malformed item]')
+                return
+            item_id = str(item.get('id', '?'))
+            if kind == 'item.started':
+                if item_id not in self.inflight and len(self.inflight) == INFLIGHT_CAP:
+                    self.inflight.popitem(last=False)
+                    self.evicted += 1
+                self.inflight[item_id] = True
+            elif kind == 'item.completed':
+                self.inflight.pop(item_id, None)
+            item_kind = item.get('type', 'item')
+            if item_kind == 'command_execution':
+                self.note('command: {} [output omitted]'.format(item.get('command', '')))
+            else:
+                self.note('{}: {}'.format(item_kind, item.get('text', item.get('message', ''))))
+
+    def feed(self, chunk):
+        # Split only the bounded refresh chunk; never retain an oversized partial.
+        pieces = chunk.split(b'\n')
+        for index, piece in enumerate(pieces):
+            newline = index < len(pieces) - 1
+            if self.discard:
+                if newline:
+                    self.discard = False
+                continue
+            if len(self.partial) + len(piece) > RECORD_CAP:
+                self.partial = b''
+                self.note('[record truncated]')
+                self.discard = not newline
+                continue
+            self.partial += piece
+            if newline:
+                record, self.partial = self.partial, b''
+                if not record.strip():
+                    continue
+                try:
+                    self.event(json.loads(record))
+                except (ValueError, UnicodeError, RecursionError):
+                    self.input_state = 'malformed'
+                    self.note('[malformed record]')
+
+    def refresh(self):
+        self.bytes_read = 0
+        try:
+            with open(self.path, 'rb') as f:
+                stat = os.fstat(f.fileno())
+                file_id = (stat.st_dev, stat.st_ino)
+                if self.file_id is not None and (file_id != self.file_id or stat.st_size < self.offset):
+                    self.offset = 0
+                    self.partial = b''
+                    self.discard = False
+                    self.inflight.clear()
+                    self.status = 'waiting'
+                    self.failed = False
+                    self.note('[log replaced or truncated]')
+                self.file_id = file_id
+                f.seek(self.offset)
+                chunk = f.read(READ_CAP)
+                self.bytes_read = len(chunk)
+                self.offset += len(chunk)
+                self.input_state = 'empty' if stat.st_size == 0 else 'available'
+                self.feed(chunk)
+        except FileNotFoundError:
+            self.input_state = 'unavailable'
+        except OSError:
+            self.input_state = 'unreadable'
+
+
+class View:
+    def __init__(self, directory=None, log=None):
+        self.directory = directory or registry_dir()
+        self.log = log
+        self.followers = {}
+        self.jobs = []
+        self.focus = None
+        self.state = 'unavailable'
+
+    def refresh(self):
+        if self.log:
+            self.state = 'explicit log'
+            self.jobs = [dict(job_id='log', state='unknown', runlog=self.log)]
+        else:
+            self.state, self.jobs = roster(self.directory)
+        ids = [j['job_id'] for j in self.jobs]
+        if self.focus not in ids:
+            self.focus = ids[0] if ids else None
+        current = {}
+        for job in self.jobs:
+            path = job.get('runlog')
+            if path:
+                follower = self.followers.get(job['job_id'])
+                if follower is None or follower.path != path:
+                    follower = Follower(path)
+                follower.refresh()
+                current[job['job_id']] = follower
+        self.followers = current
+
+    def move(self, delta):
+        ids = [j['job_id'] for j in self.jobs]
+        if ids:
+            self.focus = ids[(ids.index(self.focus) + delta) % len(ids)]
+
+    def render(self, width, height):
+        # Plain Text prevents log content from being interpreted as Rich markup.
+        lines = ['codex-jobs | {} | j/k focus, q quit'.format(self.state)]
+        for job in self.jobs:
+            label = '{} {} {}'.format(job['job_id'], job.get('model', ''), job['state'])
+            follower = self.followers.get(job['job_id'])
+            if follower:
+                label += ' | {} | {}'.format(follower.status, follower.input_state)
+            lines.append(('> ' if job['job_id'] == self.focus else '  ') + label)
+        follower = self.followers.get(self.focus)
+        if follower:
+            lines.append('detail | in-flight={} evicted={}'.format(len(follower.inflight), follower.evicted))
+            room = max(0, height - len(lines))
+            if room:
+                lines.extend(list(follower.detail)[-room:])
+        result = Text()
+        for i, line in enumerate(lines[:max(1, height)]):
+            value = Text(re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', line))
+            value.truncate(max(1, width), overflow='crop')
+            if i:
+                result.append('\n')
+            result.append_text(value)
+        return result
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--log', help='follow an explicit JSONL file (EOF is not completion)')
+    parser.add_argument('--once', action='store_true', help='render one refresh and exit')
+    args = parser.parse_args()
+    view = View(log=os.path.abspath(args.log) if args.log else None)
+    console = Console()
+    view.refresh()
+    if args.once:
+        console.print(view.render(console.width, console.height))
+        return 0
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd) if sys.stdin.isatty() else None
+    try:
+        if saved:
+            tty.setcbreak(fd)
+        with Live(console=console, screen=True, auto_refresh=False) as live:
+            while True:
+                view.refresh()
+                size = shutil.get_terminal_size((80, 24))
+                live.update(view.render(size.columns, size.lines), refresh=True)
+                if saved and select.select([fd], [], [], 0.2)[0]:
+                    key = os.read(fd, 1)
+                    if key == b'q':
+                        break
+                    if key in (b'j', b'\t'):
+                        view.move(1)
+                    elif key == b'k':
+                        view.move(-1)
+                else:
+                    time.sleep(0.2)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if saved:
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

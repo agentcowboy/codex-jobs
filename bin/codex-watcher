@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+command -v tmux >/dev/null || { echo 'tmux is required' >&2; exit 2; }
+[[ -n ${TMUX:-} ]] || { echo 'run codex-watcher inside tmux' >&2; exit 2; }
+[[ $# -le 1 ]] || { echo 'usage: codex-watcher [start|stop]' >&2; exit 2; }
+action=${1:-start}
+[[ $action == start || $action == stop ]] || { echo 'usage: codex-watcher [start|stop]' >&2; exit 2; }
+# Window IDs are unambiguous even if another window has the same name/index.
+[[ -n ${TMUX_PANE:-} ]] || { echo 'caller pane is unavailable' >&2; exit 2; }
+window=$(tmux display-message -p -t "$TMUX_PANE" '#{window_id}')
+mapfile -t marked < <(tmux list-panes -t "$window" -F '#{pane_id} #{@codex-jobs-view}' | awk '$2 == "1" {print $1}')
+if [[ $action == stop ]]; then
+    for pane in "${marked[@]}"; do tmux kill-pane -t "$pane"; done
+    exit 0
+fi
+viewer=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/codex-view
+[[ -x $viewer ]] || { echo 'viewer is unavailable' >&2; exit 2; }
+python3 -c 'import rich' 2>/dev/null || { echo 'Rich is required: install requirements.txt' >&2; exit 2; }
+for pane in "${marked[@]}"; do
+    if [[ $(tmux display-message -p -t "$pane" '#{pane_dead}') == 0 ]]; then
+        echo "$pane"
+        exit 0
+    fi
+    tmux kill-pane -t "$pane"
+done
+printf -v command 'exec %q %q' "$(command -v python3)" "$viewer"
+pane=$(tmux split-window -d -v -t "$window" -P -F '#{pane_id}' "$command")
+tmux set-option -p -t "$pane" @codex-jobs-view 1
+echo "$pane"
