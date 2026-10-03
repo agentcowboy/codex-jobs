@@ -156,6 +156,16 @@ class ViewTests(unittest.TestCase):
         with patch('builtins.open',side_effect=denied):
             self.assertEqual(view.roster(str(self.root))[1][0]['state'],'unreadable')
 
+    def test_registry_deeply_nested(self):
+        (self.root/'deep.json').write_text('['*1100+'0'+']'*1100)
+        state,jobs=view.roster(str(self.root))
+        self.assertEqual(state,'available')
+        self.assertEqual(jobs[0]['state'],'malformed')
+        result=subprocess.run([str(ROOT/'bin/codex-view'),'--once','--registry',str(self.root)],
+                              stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        self.assertEqual(result.returncode,0,result.stderr.decode())
+        self.assertIn(b'malformed',result.stdout)
+
     def test_identity_stale(self):
         data=self.descriptor(); self.assertEqual(view.identity(data),'active')
         data['pid_start']+=1; self.assertEqual(view.identity(data),'stale')
@@ -247,7 +257,7 @@ class ViewTests(unittest.TestCase):
 if __name__ == '__main__':
     suite=unittest.defaultTestLoader.loadTestsFromTestCase(ViewTests)
     result=unittest.TextTestRunner(stream=sys.stderr,verbosity=1).run(suite)
-    if result.testsRun != 23 or result.skipped or not result.wasSuccessful():
-        sys.stderr.write('ASSERTION: viewer executed case count=23, zero failures/errors/skips required; actual={} skips={}\n'.format(result.testsRun,len(result.skipped)))
+    if result.testsRun != 24 or result.skipped or not result.wasSuccessful():
+        sys.stderr.write('ASSERTION: viewer executed case count=24, zero failures/errors/skips required; actual={} skips={}\n'.format(result.testsRun,len(result.skipped)))
         sys.exit(1)
     print('VIEW cases={} passed={} failures=0 skips=0'.format(result.testsRun,result.testsRun))

@@ -5,61 +5,69 @@ command -v tmux >/dev/null || { echo 'tmux is required; watcher suite cannot run
 python3 -c 'import rich' 2>/dev/null || { echo 'Rich is required; watcher suite cannot run' >&2; exit 1; }
 export PATH="$root/bin:$PATH"
 work=$(mktemp -d "${TMPDIR:-/tmp}/watcher-tests.XXXXXXXX")
-socket=jobs-$$-$RANDOM
+sockdir=
+socket=
 unset TMUX TMUX_PANE
-cleanup() { tmux -L "$socket" kill-server 2>/dev/null || :; rm -rf -- "$work"; }
+cleanup() { tmux -S "$socket" kill-server 2>/dev/null || :; rm -rf -- "$work" "$sockdir"; }
 trap cleanup EXIT
+# Keep the private socket path short regardless of TMPDIR length.
+sockdir=$(mktemp -d /tmp/cjw.XXXXXX)
+socket=$sockdir/s
 fail() { echo "ASSERTION: $*" >&2; exit 1; }
 cases=0
 pass() { cases=$((cases+1)); }
 # No personal tmux configuration or shared server is used.
-caller=$(tmux -L "$socket" -f /dev/null new-session -d -s tests -x 100 -y 32 -P -F '#{pane_id}' 'sleep 600')
-window=$(tmux -L "$socket" display-message -p -t "$caller" '#{window_id}')
-control=$(tmux -L "$socket" split-window -d -h -t "$window" -P -F '#{pane_id}' 'sleep 600')
-other=$(tmux -L "$socket" new-window -d -t tests -P -F '#{pane_id}' 'sleep 600')
-tmux -L "$socket" set-option -p -t "$other" @codex-jobs-view 1
-other_window=$(tmux -L "$socket" display-message -p -t "$other" '#{window_id}')
+caller=$(tmux -S "$socket" -f /dev/null new-session -d -s tests -x 100 -y 32 -P -F '#{pane_id}' 'sleep 600')
+window=$(tmux -S "$socket" display-message -p -t "$caller" '#{window_id}')
+control=$(tmux -S "$socket" split-window -d -h -t "$window" -P -F '#{pane_id}' 'sleep 600')
+other=$(tmux -S "$socket" new-window -d -t tests -P -F '#{pane_id}' 'sleep 600')
+tmux -S "$socket" set-option -p -t "$other" @codex-jobs-view 1
+other_window=$(tmux -S "$socket" display-message -p -t "$other" '#{window_id}')
 # Deliberately select the other window; ownership follows the caller's pane.
-tmux -L "$socket" select-window -t "$other_window"
-export TMUX=$(tmux -L "$socket" display-message -p -t "$caller" '#{socket_path},#{pid},0') TMUX_PANE=$caller
+tmux -S "$socket" select-window -t "$other_window"
+export TMUX=$(tmux -S "$socket" display-message -p -t "$caller" '#{socket_path},#{pid},0') TMUX_PANE=$caller
 export XDG_STATE_HOME=$work/state
-pane_exists() { tmux -L "$socket" display-message -p -t "$1" '#{pane_id}' 2>/dev/null | python3 -c 'import sys; sys.exit(0 if sys.stdin.read().strip()==sys.argv[1] else 1)' "$1"; }
+pane_exists() { tmux -S "$socket" display-message -p -t "$1" '#{pane_id}' 2>/dev/null | python3 -c 'import sys; sys.exit(0 if sys.stdin.read().strip()==sys.argv[1] else 1)' "$1"; }
 assert_other() {
     pane_exists "$other" || fail 'marked pane in other window survives'
-    [[ $(tmux -L "$socket" display-message -p -t "$other" '#{@codex-jobs-view}') == 1 ]] || fail 'other window marker preserved'
+    [[ $(tmux -S "$socket" display-message -p -t "$other" '#{@codex-jobs-view}') == 1 ]] || fail 'other window marker preserved'
     pane_exists "$control" || fail 'unmarked control pane survives'
     pane_exists "$caller" || fail 'caller pane survives'
 }
 assert_viewer() {
     local pane=$1 expected_python=${2:-$(command -v python3)}
     python3 - "$socket" "$pane" "$root/bin/codex-view" "$expected_python" <<'PY'
-import subprocess, sys, time
+import os, subprocess, sys, time
 socket, pane, viewer, interpreter = sys.argv[1:]
 deadline = time.monotonic()+5
 while True:
-    state = subprocess.check_output(['tmux','-L',socket,'display-message','-p','-t',pane,
+    state = subprocess.check_output(['tmux','-S',socket,'display-message','-p','-t',pane,
                                      '#{pane_dead} #{pane_pid}'],stderr=subprocess.DEVNULL).decode().split()
     assert state[0] == '0', 'real viewer alive after start'
     try:
         with open('/proc/{}/cmdline'.format(state[1]),'rb') as f: args=f.read().split(b'\0')
-        if viewer.encode() in args and args[0] == interpreter.encode(): break
+        if viewer.encode() in args and args[0] == interpreter.encode():
+            assert b'--registry' in args, 'explicit registry argument'
+            expected = os.path.abspath(os.path.join(os.environ['XDG_STATE_HOME'], 'codex-jobs', 'active')).encode()
+            assert args[args.index(b'--registry')+1] == expected, 'caller registry reaches viewer pane'
+            break
     except FileNotFoundError: pass
     assert time.monotonic() < deadline, 'pane runs real shipped viewer with caller interpreter'
     time.sleep(.02)
 PY
-    [[ $(tmux -L "$socket" display-message -p -t "$pane" '#{window_id}') == "$window" ]] || fail 'viewer belongs to caller window ID'
+    [[ $(tmux -S "$socket" display-message -p -t "$pane" '#{window_id}') == "$window" ]] || fail 'viewer belongs to caller window ID'
 }
 
 case_start() {
     python3 -m venv --without-pip --system-site-packages "$work/venv"
     pane=$(PATH="$work/venv/bin:$PATH" codex-watcher start)
-    [[ $(tmux -L "$socket" display-message -p -t "$pane" '#{@codex-jobs-view}') == 1 ]] || fail 'viewer marked'
+    [[ $(tmux -S "$socket" display-message -p -t "$pane" '#{@codex-jobs-view}') == 1 ]] || fail 'viewer marked'
     assert_viewer "$pane" "$work/venv/bin/python3"; assert_other; pass
 }
 case_reuse() {
     again=$(codex-watcher start)
     [[ $again == "$pane" ]] || fail 'start reuses same marked viewer'
-    count=$(tmux -L "$socket" list-panes -t "$window" -F '#{@codex-jobs-view}' | awk '$1 == "1" {n++} END {print n+0}')
+    count=$(tmux -S "$socket" list-panes -t "$window" -F '#{@codex-jobs-view}' | awk '$1 == "1" {n++} END {print n+0}')
     [[ $count == 1 ]] || fail 'one marked pane in caller window'
     assert_viewer "$pane" "$work/venv/bin/python3"; assert_other; pass
 }
@@ -81,11 +89,11 @@ case_dependencies() {
     assert_other; pass
 }
 case_restart_dead() {
-    tmux -L "$socket" set-option -w -t "$window" remain-on-exit on
-    dead=$(tmux -L "$socket" split-window -d -v -t "$window" -P -F '#{pane_id}' 'exit 0')
-    tmux -L "$socket" set-option -p -t "$dead" @codex-jobs-view 1
+    tmux -S "$socket" set-option -w -t "$window" remain-on-exit on
+    dead=$(tmux -S "$socket" split-window -d -v -t "$window" -P -F '#{pane_id}' 'exit 0')
+    tmux -S "$socket" set-option -p -t "$dead" @codex-jobs-view 1
     sleep 0.2
-    [[ $(tmux -L "$socket" display-message -p -t "$dead" '#{pane_dead}') == 1 ]] || fail 'dead-pane fixture'
+    [[ $(tmux -S "$socket" display-message -p -t "$dead" '#{pane_dead}') == 1 ]] || fail 'dead-pane fixture'
     pane=$(codex-watcher start)
     [[ $pane != "$dead" ]] || fail 'dead marked pane replaced'
     if pane_exists "$dead"; then fail 'dead marked pane removed'; fi

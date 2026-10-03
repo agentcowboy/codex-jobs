@@ -46,6 +46,7 @@ assert_args() {
     python3 - "$dir" "$1" "$2" <<'PY'
 import json, os, sys
 root, mode, sandbox = sys.argv[1:]
+root = os.path.abspath(root)
 with open(root+'/fake/argv.json') as f: actual = json.load(f)
 expected = ['exec', '-C', root+'/cwd', '--sandbox', sandbox, '-c', 'approval_policy="never"',
             '-m', 'demo-model', '-c', 'model_reasoning_effort=high']
@@ -116,6 +117,32 @@ case_resume() {
     assert_rc 0 codex-hands resume --cwd "$dir/cwd" demo-session demo-model high "$dir/prompt" "$dir/out" "$dir/log"
     assert_args resume read-only; assert_receipt 0; pass
 }
+case_readme_resume() {
+    setup readme-resume; assert_rc 0 invoke
+    cp "$dir/log" "$dir/run.jsonl"
+    local recipe
+    recipe=$(python3 - "$root/README.md" <<'PY'
+import sys
+with open(sys.argv[1]) as f:
+    lines = [line.rstrip('\n') for line in f if line.startswith('SESSION=$(python3 -c ')]
+assert len(lines) == 1, 'one exact README session extractor'
+print(lines[0])
+PY
+)
+    SESSION=$(cd -- "$dir"; eval "$recipe" || exit $?; printf '%s\n' "$SESSION")
+    [[ $SESSION == demo-session ]] || fail 'README extracts fake thread ID'
+    assert_rc 0 codex-hands resume --cwd "$dir/cwd" "$SESSION" demo-model high "$dir/prompt" "$dir/out" "$dir/log"
+    assert_args resume read-only; assert_receipt 0
+    # A run log may exist before Codex emits its first thread event.
+    for content in '' '{"type":"turn.completed"}'; do
+        printf '%s' "$content" > "$dir/run.jsonl"
+        local rc=0
+        (cd -- "$dir"; eval "$recipe") > "$dir/extract.out" 2> "$dir/extract.err" || rc=$?
+        [[ $rc == 1 && ! -s $dir/extract.out ]] || fail 'README missing thread exits nonzero without session'
+        [[ $(< "$dir/extract.err") == 'no thread.started event yet in run.jsonl' ]] || fail 'README missing thread message without traceback'
+    done
+    pass
+}
 case_write_fresh() {
     setup write-fresh; assert_rc 0 invoke --sandbox workspace-write
     assert_args fresh workspace-write; pass
@@ -159,6 +186,59 @@ case_alias() {
     assert_rc 1 codex-hands --cwd "$dir/cwd" demo-model high "$dir/prompt" "$dir/symlink" "$dir/log"
     [[ ! -e $dir/fake/argv.json ]] || fail 'alias refusal before launch'
     [[ $(wc -l < "$dir/prompt") == 2 ]] || fail 'prompt not truncated'; pass
+}
+case_nonregular() {
+    setup nonregular
+    mkfifo "$dir/fifo"
+    printf 'prior output\n' > "$dir/out"
+    for role in prompt out log; do
+        local prompt=$dir/prompt out=$dir/out log=$dir/log
+        case $role in prompt) prompt=$dir/fifo;; out) out=$dir/fifo;; log) log=$dir/fifo;; esac
+        assert_rc 1 codex-hands --cwd "$dir/cwd" demo-model high "$prompt" "$out" "$log"
+        [[ $(< "$dir/stderr") == *'must be regular files'* ]] || fail 'nonregular refusal message'
+        [[ ! -e $dir/out.done && ! -e $dir/out.prev && ! -e $dir/fake/argv.json ]] || fail 'nonregular refusal before mutation or launch'
+        [[ $(< "$dir/out") == 'prior output' && -p $dir/fifo ]] || fail 'nonregular refusal preserves artifacts'
+    done
+    pass
+}
+case_missing_directory() {
+    setup missing-directory
+    assert_rc 2 codex-hands --cwd "$dir/cwd" demo-model high "$dir/prompt" "$dir/missing/out" "$dir/log"
+    [[ $(< "$dir/stderr") == 'artifact directory is unavailable' ]] || fail 'missing directory clean error'
+    [[ ! -e $dir/log && ! -e $dir/fake/argv.json ]] || fail 'missing directory before mutation or launch'
+    pass
+}
+case_abandoned_launch() {
+    setup abandoned-launch; mkdir "$dir/shim" "$dir/tmp"
+    local real_python=$(command -v python3)
+    export REAL_PYTHON=$real_python
+    cat > "$dir/shim/python3" <<'SH'
+#!/usr/bin/env bash
+if [[ $# == 2 && $1 == - && $2 =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$2" > "$FAKE_DIR/ready"
+    while [[ ! -e $FAKE_DIR/release ]]; do sleep 0.01; done
+    exit 1
+fi
+exec "$REAL_PYTHON" "$@"
+SH
+    chmod +x "$dir/shim/python3"
+    for reason in scratch parent; do
+        rm -f "$dir/fake/ready" "$dir/fake/release"
+        PATH="$dir/shim:$PATH" TMPDIR="$dir/tmp" codex-hands --cwd "$dir/cwd" demo-model high "$dir/prompt" "$dir/out" "$dir/log" > "$dir/stdout" 2> "$dir/stderr" & wrapper=$!
+        children+=("$wrapper"); wait_file "$dir/fake/ready"
+        if [[ $reason == parent ]]; then kill -KILL "$wrapper"; fi
+        : > "$dir/fake/release"
+        got=0; wait "$wrapper" 2>/dev/null || got=$?
+        [[ $got != 0 ]] || fail 'abandoned wrapper exits unsuccessfully'
+        assert_dead
+        [[ ! -e $dir/fake/argv.json && ! -e $dir/out.done ]] || fail 'abandoned launch never starts Codex or writes receipt'
+        if [[ $reason == scratch ]]; then
+            [[ -z $(find "$dir/tmp" -mindepth 1 -print -quit) ]] || fail 'failed launch removes scratch'
+        else
+            [[ -n $(find "$dir/tmp" -name pid -print -quit) ]] || fail 'killed wrapper leaves scratch for parent-loss check'
+        fi
+    done
+    pass
 }
 case_permissions() {
     setup permissions; (umask 022; invoke)
@@ -341,12 +421,16 @@ PYTEST
 
 case_fresh
 case_resume
+case_readme_resume
 case_write_fresh
 case_write_resume
 case_reject_options
 case_failure
 case_retry
 case_alias
+case_nonregular
+case_missing_directory
+case_abandoned_launch
 case_permissions
 case_registry
 case_registry_failure
@@ -359,5 +443,5 @@ case_launch_cancel
 case_forked_setsid
 case_descendants
 case_late_signal
-[[ $cases == 20 ]] || fail "runner executed case count: expected 20 got $cases"
+[[ $cases == 24 ]] || fail "runner executed case count: expected 24 got $cases"
 printf 'RUNNER cases=%s passed=%s failures=0 skips=0\n' "$cases" "$cases"

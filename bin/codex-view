@@ -84,7 +84,7 @@ def roster(directory):
             jobs.append(data)
         except OSError:
             jobs.append(dict(job_id=entry.name, state='unreadable'))
-        except (ValueError, TypeError, AttributeError):
+        except (ValueError, TypeError, AttributeError, RecursionError):
             jobs.append(dict(job_id=entry.name, state='malformed'))
     return ('available' if jobs else 'empty'), jobs
 
@@ -257,9 +257,11 @@ class View:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--log', help='follow an explicit JSONL file (EOF is not completion)')
+    parser.add_argument('--registry', help='registry directory (default: caller state directory)')
     parser.add_argument('--once', action='store_true', help='render one refresh and exit')
     args = parser.parse_args()
-    view = View(log=os.path.abspath(args.log) if args.log else None)
+    view = View(directory=os.path.abspath(args.registry) if args.registry else None,
+                log=os.path.abspath(args.log) if args.log else None)
     console = Console()
     view.refresh()
     if args.once:

@@ -23,7 +23,8 @@ for pane in "${marked[@]}"; do
     fi
     tmux kill-pane -t "$pane"
 done
-printf -v command 'exec %q %q' "$(command -v python3)" "$viewer"
+registry=$(python3 -c 'import os; base=os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"); print(os.path.abspath(os.path.join(base, "codex-jobs", "active")))')
+printf -v command 'exec %q %q --registry %q' "$(command -v python3)" "$viewer" "$registry"
 pane=$(tmux split-window -d -v -t "$window" -P -F '#{pane_id}' "$command")
 tmux set-option -p -t "$pane" @codex-jobs-view 1
 echo "$pane"

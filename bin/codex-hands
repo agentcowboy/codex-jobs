@@ -22,7 +22,6 @@ if [[ $mode == resume ]]; then [[ $# -ge 1 ]] || usage; session=$1; shift; fi
 model=$1 effort=$2 prompt=$3 out=$4 log=${5:-$4.jsonl}
 [[ -n $model && $model != -* && -n $effort && $effort != -* ]] || usage
 [[ $mode != resume || ( -n $session && $session != -* ) ]] || usage
-[[ -f $prompt && -r $prompt ]] || { echo 'prompt is unavailable' >&2; exit 2; }
 command -v python3 >/dev/null || { echo 'python3 is required' >&2; exit 2; }
 command -v setsid >/dev/null || { echo 'setsid is required' >&2; exit 2; }
 exe=${CODEX_BIN:-codex}
@@ -34,13 +33,18 @@ prompt, out, log = sys.argv[1:]
 paths = [prompt, out, log, log+'.stderr', out+'.done', out+'.prev',
          out+'.failed', log+'.prev', log+'.stderr.prev']
 for i, path in enumerate(paths):
-    if i and (os.path.islink(path) or os.path.isdir(path)):
-        sys.exit('artifact must be a regular file, not a symlink or directory')
+    if (i and os.path.islink(path)) or (os.path.exists(path) and not os.path.isfile(path)):
+        sys.exit('prompt and artifacts must be regular files; artifact symlinks are refused')
     for other in paths[:i]:
         if os.path.realpath(path) == os.path.realpath(other) or (
             os.path.exists(path) and os.path.exists(other) and os.path.samefile(path, other)):
             sys.exit('artifact alias refused')
+for path in (out, log, log+'.stderr'):
+    if not os.path.isdir(os.path.dirname(os.path.abspath(path))):
+        print('artifact directory is unavailable', file=sys.stderr)
+        sys.exit(2)
 PY
+[[ -f $prompt && -r $prompt ]] || { echo 'prompt is unavailable' >&2; exit 2; }
 cwd=$(cd -- "$cwd" && pwd -P)
 out=$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$out")
 log=$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$log")
@@ -86,10 +90,13 @@ args=(exec -C "$cwd" --sandbox "$sandbox" -c 'approval_policy="never"' -m "$mode
 args+=(--json -o "$out" -)
 setsid --wait bash -c '
     printf "%s\n" "$$" > "$1/pid"
-    while [[ ! -e $1/go ]]; do sleep 0.01; done
-    shift
+    while [[ ! -e $1/go ]]; do
+        [[ -d $1 ]] && kill -0 "$2" 2>/dev/null || exit 1
+        sleep 0.01
+    done
+    shift 2
     exec "$@"
-' bash "$scratch" "$exe" "${args[@]}" < "$prompt" > "$log" 2> "$log.stderr" &
+' bash "$scratch" "$$" "$exe" "${args[@]}" < "$prompt" > "$log" 2> "$log.stderr" &
 leader=$!
 # Signals only set cancel_signal here; never clean an unverified numeric group.
 for ((attempt=0; attempt<500; attempt++)); do
