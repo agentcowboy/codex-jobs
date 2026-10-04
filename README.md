@@ -18,7 +18,7 @@ Activate this venv before using `codex-view` or `codex-watcher`. You can also ru
 
 ## Quick start
 
-Choose supported `MODEL` and `EFFORT` values from the Codex CLI docs linked above, then run this in the first terminal:
+Choose a `MODEL` using `/model` in interactive Codex. For `EFFORT`, see the [`model_reasoning_effort` configuration setting](https://learn.chatgpt.com/docs/config-file/config-reference) (supported levels depend on the model and client), then run this in the first terminal:
 
 ```bash
 MODEL='replace-with-your-model'
@@ -140,3 +140,5 @@ CODEX_JOBS ACCEPTANCE PASS
 ```
 
 Acceptance tests wrapper behavior against a synthetic Codex, not real Codex permission or resume behavior. Maintenance is best effort; rerun acceptance after changes. MIT licensed; see [LICENSE](LICENSE).
+
+- v0.1.3: Correct the quick-start model and reasoning-effort pointers.
